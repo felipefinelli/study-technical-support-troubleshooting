@@ -1,25 +1,20 @@
 # Incident 01 — Online Navigation
 
-## Jira ticket
-
-> **INC-78342**
->
+> **Jira ticket:** INC-78342  
 > **Market:** Italy  
 > **Feature:** Online Navigation  
-> **Reported:** 2026-08-12 15:40 UTC
->
-> **Customer report:**  
-> Some users receive an error when searching for an online route.
->
+> **Reported:** 2026-08-12 15:40 UTC  
+> **Customer report:** Some users receive an error when searching for an online route.  
 > **Example vehicle:** VEH-0092
 
-## 1. Initial database analysis
-
-I will start in the database using SQL.
+I will start by querying the database using SQL.
 
 First, I want to understand whether the incident is limited to Italy and Online Navigation or whether other markets and services show the same pattern.
 
-The query below covers the five hours before the incident was reported, from 10:40 to 15:40 UTC.
+The query below covers the five hours before the incident was reported.
+
+
+
 
 ```sql
 SELECT
@@ -27,27 +22,38 @@ SELECT
     s.service,
     s.http_status,
     s.error_code,
-    COUNT(*) AS total
-FROM
-    service_requests s
-JOIN
-    vehicles v ON s.vehicle_id = v.vehicle_id
+    COUNT(*) AS failed_requests,
+    COUNT(DISTINCT s.vehicle_id) AS affected_vehicles
+FROM 
+	service_requests s
+JOIN 
+	vehicles v ON v.vehicle_id = s.vehicle_id
 WHERE
     s.requested_at BETWEEN '2026-08-12T10:40:00' AND '2026-08-12T15:40:00'
+    AND s.http_status >= 400
 GROUP BY
     v.market,
     s.service,
     s.http_status,
     s.error_code
 ORDER BY
-    total DESC;
+    failed_requests DESC
 ```
 
-![1](image-1.png)
+**Results:**
 
-With this first query, we can confirm that the issue is indeed occurring only in Italy and in the Navigation service. The results show 36 requests failing with HTTP `502` and `ROUTING_PROVIDER_ERROR`.
+```text
+market|service         |http_status|error_code            |failed_requests|affected_vehicles|
+------+----------------+-----------+----------------------+---------------+-----------------+
+IT    |navigation      |        502|ROUTING_PROVIDER_ERROR|             36|               30|
+DE    |maintenance     |        403|PERMISSION_DENIED     |              1|                1|
+DE    |maintenance     |        500|INTERNAL_ERROR        |              1|                1|
+DE    |vehicle_location|        404|VEHICLE_NOT_FOUND     |              1|                1|
+IT    |maintenance     |        500|INTERNAL_ERROR        |              1|                1|
+PT    |vehicle_location|        403|PERMISSION_DENIED     |              1|                1|
+```
 
-## 2. Vehicle segment check
+The results show a clear failure pattern affecting Navigation requests from Italy, with 36 requests failing with HTTP `502` and `ROUTING_PROVIDER_ERROR`.
 
 As a precaution, I also want to verify whether the failures are limited to a specific model, model year, or software version.
 
@@ -56,7 +62,7 @@ SELECT
     v.model,
     v.model_year,
     v.software_version,
-    COUNT(*) AS total_error
+    COUNT(DISTINCT s.vehicle_id) AS affected_vehicles
 FROM
     service_requests s
 JOIN
@@ -72,20 +78,47 @@ GROUP BY
     v.model_year,
     v.software_version
 ORDER BY
-    total_error DESC;
+    affected_vehicles DESC;
 ```
 
-![2](image-2.png)
+**Results:**
 
-The failures are distributed across multiple models, model years, and software versions. This means there is no clear evidence that a specific vehicle segment is responsible for the incident.
+```text
+model  |model_year|software_version|affected_vehicles|
+-------+----------+----------------+-----------------+
+Model-D|      2023|4.2.0           |                3|
+Model-A|      2026|4.2.1           |                2|
+Model-B|      2022|4.2.0           |                2|
+Model-C|      2025|5.0.0           |                2|
+Model-A|      2021|5.0.0           |                1|
+Model-A|      2024|4.2.1           |                1|
+Model-A|      2025|4.2.0           |                1|
+Model-B|      2023|4.1.0           |                1|
+Model-B|      2023|4.2.0           |                1|
+Model-B|      2024|4.2.1           |                1|
+Model-B|      2025|4.2.0           |                1|
+Model-B|      2026|4.1.0           |                1|
+Model-C|      2021|4.1.0           |                1|
+Model-C|      2021|4.2.0           |                1|
+Model-C|      2022|5.0.0           |                1|
+Model-C|      2023|4.2.0           |                1|
+Model-C|      2025|4.1.0           |                1|
+Model-C|      2026|4.1.0           |                1|
+Model-D|      2021|4.2.0           |                1|
+Model-D|      2022|4.2.0           |                1|
+Model-D|      2023|4.1.0           |                1|
+Model-D|      2024|4.2.0           |                1|
+Model-D|      2024|4.2.1           |                1|
+Model-D|      2025|4.1.0           |                1|
+Model-D|      2026|4.2.1           |                1|
+```
 
-## 3. Tracing an affected request
+The failures are distributed across multiple models, model years, and software versions. 
 
-At this point, the database analysis has confirmed that the main error pattern is limited to Online Navigation requests from Italy and is not linked to a specific vehicle segment.
+Since there is no clear evidence that a specific vehicle segment is responsible for the incident, I will now focus on the error pattern shared by the affected requests.
 
-However, the database only shows the final result of each request. It does not show what happened between the different system components or exactly where the failure started.
-
-To investigate further, I will select one of the affected requests and use its `correlation_id` to find all related events in Kibana. This will allow us to follow the complete request path and identify the component where the failure occurred.
+The database shows the final result of each request, but not what happens between the different system components or where the failure starts.
+To investigate this, I will select one of the affected requests and use its `correlation_id` to find all related events in Kibana. This will allow me to follow the complete request path and identify where the failure occurs.
 
 The following query retrieves the `correlation_id` values for the affected requests:
 
@@ -105,62 +138,65 @@ WHERE
     AND s.http_status = 502
     AND s.error_code = 'ROUTING_PROVIDER_ERROR'
 ORDER BY
-    s.requested_at DESC;
+    s.requested_at DESC
+LIMIT
+    7;
 ```
 
-![3](image-3.png)
-
-I will use the most recent failed request for the vehicle reported in the ticket:
-
-- **Vehicle ID:** `VEH-0092`
-- **Correlation ID:** `req-ba04e6b6151e4685`
-
-## 4. Kibana investigation
-
-In Kibana, I searched for the selected `correlation_id` to display all events from the same request.
-
-Below, we can see the complete request trace in Kibana:
-
-![4](image-4.png)
-
-The request followed this path:
+**Results:**
 
 ```text
-15:38:21.000 | api-gateway               | INFO  | Incoming request received
-        ↓
-15:38:21.015 | navigation-service        | INFO  | Route calculation started
-        ↓
-15:38:21.035 | maps-adapter              | INFO  | Calling external routing provider
-        ↓
-15:38:23.860 | external-routing-provider | WARN  | Request rejected (HTTP 429 — RATE_LIMITED)
-        ↓
-15:38:23.900 | maps-adapter              | ERROR | External provider request failed (upstream HTTP 429)
-        ↓
-15:38:23.940 | navigation-service        | ERROR | Route calculation failed (HTTP 502 — ROUTING_PROVIDER_ERROR)
-        ↓
-15:38:23.945 | api-gateway               | INFO  | Response returned to client (HTTP 502)
+requested_at       |vehicle_id|correlation_id      |
+-------------------+----------+--------------------+
+2026-08-12T15:38:21|VEH-0092  |req-ba04e6b6151e4685|
+2026-08-12T15:37:09|VEH-0418  |req-d7cab8e957c74e89|
+2026-08-12T15:36:19|VEH-0097  |req-e5141e0293114e75|
+2026-08-12T15:33:19|VEH-0440  |req-7065da37073b401e|
+2026-08-12T15:33:14|VEH-0335  |req-f1719c6523c649f1|
+2026-08-12T15:32:58|VEH-0358  |req-d6af332c70a84ed9|
+2026-08-12T15:30:56|VEH-0406  |req-35f1fcc2c8ad4eb0|
 ```
 
-I checked additional affected `correlation_id` values and found the same sequence of events.
+I will use the most recent failed request for the vehicle reported in the ticket: `VEH-0092`, with correlation ID `req-ba04e6b6151e4685`.
 
-## Conclusion
+Now I can search for the selected `correlation_id` to display all events associated with the same request. Below, we can see the complete path of the request:
 
-The requests reached the Navigation Service and Maps Adapter successfully. The failure occurred when the external routing provider rejected the requests with HTTP `429 RATE_LIMITED`. The platform then returned HTTP `502 ROUTING_PROVIDER_ERROR` to the customer.
+<img src="image-4.png" alt="Complete request path in Kibana" width="30%">
 
-The logs show where the failure occurred, but they do not explain why the rate limit was applied. Possible causes include an exceeded quota, an unexpected request rate, an integration configuration problem, or a change on the provider side. Therefore, the root cause is still under investigation.
+```text
+15:38:21.000
+INFO
+Incoming request received
+        ↓
+15:38:21.015
+INFO
+Route calculation started
+        ↓
+15:38:21.035
+INFO
+Calling external routing provider
+        ↓
+15:38:23.860
+WARN
+Routing provider rejected request (HTTP 429 — RATE_LIMITED)
+        ↓
+15:38:23.900
+ERROR
+External routing provider request failed
+        ↓
+15:38:23.940
+ERROR
+Route calculation failed (HTTP 502 — ROUTING_PROVIDER_ERROR)
+        ↓
+15:38:23.945
+INFO
+HTTP 502 returned to the customer
+```
 
-## Next step
+Additional affected `correlation_id` values show the same sequence of events.
 
-The incident could be escalated to the team responsible for Navigation Integrations. The exact ownership and escalation procedure should be confirmed in Confluence.
+Based on this analysis, the requests reach the Navigation Service successfully. The failure occurs when the external routing provider rejects the requests with HTTP `429 RATE_LIMITED`. The platform then returns HTTP `502 ROUTING_PROVIDER_ERROR` to the customer.
 
-## Suggested Jira update
+The logs show where the failure occurs, but they do not explain why the rate limit is applied. Possible causes include an exceeded quota, an unexpected request rate, an integration configuration problem, or a change on the provider side. Therefore, the root cause remains under investigation.
 
-> Initial analysis completed.
->
-> Between 10:40 and 15:40 UTC, 36 Online Navigation requests from Italy failed with HTTP 502 and `ROUTING_PROVIDER_ERROR`, affecting 30 unique vehicles. The failures are distributed across multiple models, model years, and software versions, with no clear vehicle segment identified.
->
-> Sample traces show that the requests reach the Navigation Service and Maps Adapter successfully. The failure occurs when the external routing provider responds with HTTP 429 `RATE_LIMITED`. The platform then returns HTTP 502 to the customer.
->
-> Multiple affected requests show the same behavior. The reason for the provider rate limit is not visible in the available logs.
->
-> Escalating to the Navigation Integrations team for further investigation.
+The next step is to confirm the appropriate ownership and escalation procedure in Confluence, then escalate the incident to the team responsible for Navigation Integrations.
