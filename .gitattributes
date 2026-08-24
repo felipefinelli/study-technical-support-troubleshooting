@@ -1,3 +1,4 @@
-incidents/incident-01-online-navigation/README.md linguist-language=SQL linguist-detectable=true
-incidents/incident-02-vehicle-status/README.md linguist-language=SQL linguist-detectable=true
-*.py linguist-detectable=true
+incidents/incident-01-online-navigation/README.md -linguist-documentation linguist-language=SQL linguist-detectable
+incidents/incident-02-vehicle-status/README.md -linguist-documentation linguist-language=SQL linguist-detectable
+
+*.py linguist-detectable
