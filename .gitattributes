@@ -1,0 +1,2 @@
+incidents/**/README.md linguist-language=SQL linguist-detectable=true
+*.py linguist-detectable=true
